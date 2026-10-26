@@ -22,6 +22,10 @@ installation does not guarantee that an airline will return a fare.
 | Air India | http://127.0.0.1:8789/ | [airindia-collector/README.md](airindia-collector/README.md) |
 | Air India Express | http://127.0.0.1:8791/ | [airindia-express-collector/README.md](airindia-express-collector/README.md) |
 
+## Troubleshooting
+
+See [Troubleshooting and recorded failure history](TROUBLESHOOTING.md) for plain-language meanings of common failures, known dated issues, and guidance on logs and credentials.
+
 ## Requirements
 
 Ubuntu 22.04/24.04, macOS, or Windows 10/11; Git; Node.js 20 or newer; Google
