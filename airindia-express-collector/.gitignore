@@ -1,0 +1,12 @@
+node_modules/
+.session/
+runs/
+web-runs/
+artifacts/*.log
+*.log
+diagnostics/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example

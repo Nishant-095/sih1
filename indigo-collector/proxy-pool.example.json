@@ -1,0 +1,6 @@
+{
+  "proxies": [
+    { "id": "primary", "server": "http://proxy-one.example:8080" },
+    { "id": "backup", "server": "socks5://proxy-two.example:1080" }
+  ]
+}

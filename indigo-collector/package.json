@@ -1,0 +1,19 @@
+{
+  "name": "indigo-direct-fares",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "collect": "node src/collect.mjs",
+    "collect:chrome": "node scripts/collect-with-chrome.mjs",
+    "web": "node scripts/web-server.mjs",
+    "verify:runs": "node scripts/verify-runs.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

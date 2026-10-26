@@ -1,0 +1,10 @@
+node_modules/
+.session/
+runs/
+web-runs/
+diagnostics/
+premium-audit.json
+yolov8m-seg.pt
+*.log
+__pycache__/
+*.pyc

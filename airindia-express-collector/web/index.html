@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#e15b2e">
+  <title>Air India Express Fare Desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%236735db'/%3E%3Cpath d='M17 46 46 17M30 17h16v16' fill='none' stroke='white' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">✈</span><div><strong>FARE DESK</strong><small>Air India Express · direct site</small></div></div>
+      <div class="live-pill"><span class="live-dot" aria-hidden="true"></span> LOCAL WORKSPACE</div>
+    </header>
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-copy"><p class="eyebrow">FLIGHT RESEARCH / DIRECT AIRLINE</p><h1 id="page-title">Air India Express.<br><em>Observed carefully.</em></h1><p class="intro">Submit a route and date through the official booking form. This collector records page and response evidence; fares stay unavailable until the live IX response format can be verified.</p></div>
+        <div class="hero-visual" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><span class="airport-code left-code">DEL</span><span class="flight-line"><i></i><b>✈</b></span><span class="airport-code right-code">BOM</span><span class="visual-note">LIVE SEARCH / PAGE EVIDENCE</span></div>
+      </section>
+      <section class="setup-card" aria-labelledby="setup-title">
+        <div class="section-heading"><div><p class="eyebrow">01 / PLAN</p><h2 id="setup-title">Set up a collection</h2></div><p>One route per line · airport codes</p></div>
+        <form id="run-form" novalidate>
+          <div class="form-grid">
+            <div class="field route-field"><label for="routes">Routes</label><textarea id="routes" rows="4" spellcheck="false" aria-describedby="routes-help routes-error" placeholder="DEL-BOM&#10;BLR-PNQ">DEL-BOM</textarea><small id="routes-help">One airport-code pair per line. Searches run sequentially.</small><div class="route-presets" aria-label="Route shortcuts"><span>Quick add</span><button type="button" data-route="DEL-BOM">DEL–BOM</button><button type="button" data-route="DEL-BLR">DEL–BLR</button><button type="button" data-route="BOM-MAA">BOM–MAA</button><button type="button" data-route="DEL-HYD">DEL–HYD</button><button type="button" data-route="BLR-CCU">BLR–CCU</button><button type="button" data-route="BLR-PNQ">BLR–PNQ</button><button type="button" data-route="BOM-BLR">BOM–BLR</button><button type="button" data-route="DEL-CCU">DEL–CCU</button><button type="button" data-route="DEL-MAA">DEL–MAA</button></div><p class="field-error" id="routes-error" role="alert"></p></div>
+            <fieldset class="date-field"><legend>Travel dates <span>from today in India</span></legend><div id="dates" class="date-options"></div><small>Dates are fixed when you start a run.</small></fieldset>
+          </div>
+          <div class="launch-bar"><label class="agent-field" for="browser">Browser <select id="browser"><option value="chrome" selected>Chrome</option><option value="firefox">Firefox</option></select></label><label class="agent-field" for="browser-mode">Window <select id="browser-mode"><option value="headed" selected>Visible</option><option value="headless">Headless</option></select></label><label class="agent-field"><input type="checkbox" id="disable-http2"> Chrome: disable HTTP/2</label><p id="plan-summary" class="plan-summary"></p><button class="start-button" type="submit" id="start"><span>Search Air India Express</span><span aria-hidden="true">↗</span></button></div>
+          <p class="form-note">1800 ms interaction pauses · one browser task at a time · access denial or CAPTCHA stops the batch. No fare is shown unless route, date, IX flight, response, and page evidence verify.</p>
+          <p id="form-error" class="form-error" role="alert" aria-live="assertive"></p>
+        </form>
+      </section>
+      <section class="results-section" aria-labelledby="results-title">
+        <div class="section-heading results-heading"><div><p class="eyebrow">02 / LIVE RUN</p><h2 id="results-title">Collection progress</h2></div><div class="run-controls"><label for="run-picker" class="run-picker-label">Recent run <select id="run-picker" aria-label="Choose a saved run"><option value="">None yet</option></select></label><button id="retry-all" class="retry-all-button" type="button" hidden>Retry failed searches</button><button id="delete-run" class="delete-run-button" type="button" hidden>Delete run</button><span id="connection" class="connection">Ready</span><button id="cancel" class="cancel-button" type="button" hidden>Stop run</button></div></div><div id="delete-confirm" class="delete-confirm" hidden><span>Delete this saved run, its fares, and evidence?</span><button id="confirm-delete" type="button">Delete run</button><button id="cancel-delete" type="button">Keep run</button></div><p id="recent-message" class="form-error" role="status" aria-live="polite"></p>
+        <div id="empty" class="empty-state"><div class="empty-icon">✈</div><h3>No searches yet</h3><p>Start a collection to watch each route and date move from browser launch to verified fare.</p></div>
+        <div id="run-board" hidden><div class="overview"><div><span class="overview-label">RUN STATUS</span><strong id="run-status">—</strong></div><div><span class="overview-label">SEARCHES</span><strong id="run-count">—</strong></div><div><span class="overview-label">VERIFIED FARES</span><strong id="fare-count">—</strong></div><div><span class="overview-label">STARTED</span><strong id="run-started">—</strong></div></div><p id="retry-origin" class="retry-origin" hidden></p><p id="run-resource" class="run-resource" role="status" hidden></p><div id="run-notice" class="run-notice" hidden></div><p id="run-action-error" class="form-error" role="alert" aria-live="assertive"></p><div id="task-list" class="task-list"></div></div>
+      </section>
+    </main>
+    <footer>Official Air India Express website · response schema currently unverified · no promotional, cached, or sample prices are used</footer>
+  </div>
+</body>
+</html>
