@@ -1,4 +1,22 @@
-# Live status — 9 October 2026
+# Live status — 27 October 2026 (IST)
+
+The final normal-dashboard matrix verified **12/12 queries in 12 first attempts, 275 fares**, with **zero UI Retry clicks**. The independently audited observed success rate is **100% for this twelve-query sample**. Configured local tests passed **75/75 without skips**, and targeted Chromium checks passed **25/25**.
+
+Run: `web-runs/2026-10-26T19-27-41-768Z-c96e78`. Source: `b5dc0297523365fa7391d3484299351d5397ab417bf817af8d2250518bf9c04b`. All evidence hashes, strict page/response comparisons, cabin metadata, route/date checks, and price arithmetic passed independent audit. The ordinary site-error Retry path was not triggered live; its recovery behavior is covered by local fixtures.
+
+This proves the observed sample on Linux, visible Chrome 153/CDP, the dedicated profile, direct connection, one worker, and the explicitly configured user entry. It is not a universal guarantee; headless, other operating systems, proxies, and campaign-parameter effects remain unverified.
+
+Earlier cancelled, blocked, and partial cohorts remain saved with their original outcomes. See the [27 October audit](docs/reliability-2026-10-27.md) for all twelve results, startup instructions, fixes, evidence reports, and preserved history.
+
+# Historical live status — 26 October 2026
+
+The exact user-supplied root URL `https://www.airindia.com/?ai_pc=MYFLIGHTAIR` returned HTTPS 200 in collector checks and exposed a different Angular booking widget. The user reports normal searches work in all browsers on this connection; this was not independently observed in their browser. The collector's root-entry runs have so far failed before Search on a hidden-radio selector and an airport-selection confirmation guard. These are form-handling failures, not access-denied outcomes.
+
+As of the 16:03 UTC adapter run: **four collector run attempts, zero completed fare runs, and one actual flight Search submission**. The first two legacy-entry runs were blocked (one at the booking POST, one at the redirected homepage). A separate UI probe submitted no Search. The new adapter uses ordinary visible controls and strict route/date/one-way checks; the latest bounded airport-commit correction passed independent regressions and is awaiting combined-form live validation. The production default entry remains unchanged pending evidence.
+
+The latest configured local suite passed 55/55, including the strict airport-commit and final form-guard regressions. Live collection and the broader reliability goal remain unfinished. See the [dated reliability review](docs/reliability-2026-10-26.md) for evidence references and current limits.
+
+# Historical live status — 9 October 2026
 
 ## Current focused checks
 

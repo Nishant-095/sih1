@@ -45,14 +45,21 @@ export async function verifySearch(directory, savedResult = null) {
     const offers = parseSearchResponse(response.toString(), result.query);
     if (!offers || offers.length !== result.fares.length)
       errors.push('Airline response fare count differs');
+    const unmatched = [...(offers || [])];
     for (const fare of result.fares) {
-      const offer = offers?.find(item => item.flight === fare.flight &&
-        item.departureTime === fare.departureTime);
-      if (!offer || JSON.stringify(offer) !== JSON.stringify(fare))
-        errors.push(`Saved fare differs from airline response for ${fare.flight}`);
+      const index = unmatched.findIndex(item => {
+        // Cabin is additive for older saved records only. Every other field
+        // remains part of the exact comparison, including unexpected fields.
+        const comparable = { ...item };
+        if (!Object.hasOwn(fare, 'cabin') && result.fareEvidenceVersion !== 2) delete comparable.cabin;
+        return JSON.stringify(comparable) === JSON.stringify(fare);
+      });
+      if (index < 0) errors.push(`Saved fare differs from airline response for ${fare.flight}`);
+      else unmatched.splice(index, 1);
     }
     if (offers?.length) matchFaresToCards(offers,
-      extractCardsFromHtml(page.toString()), result.query);
+      extractCardsFromHtml(page.toString()), result.query,
+      { requireCabin: result.fareEvidenceVersion === 2 || result.fares.some(fare => Object.hasOwn(fare, 'cabin')) });
   } catch (error) { errors.push(error.code || error.message); }
   return { ok: errors.length === 0, evidenceIntegrityOk: integrity.ok, errors,
     fareCount: result.fares.length,
@@ -78,7 +85,7 @@ async function verifyAgentRun(directory, manifest) {
     catch (error) { checks.push({ name, ok: false, errors: [error.message] }); }
   }
   return { run: manifest.id, status: manifest.status,
-    ok: checks.every(check => check.ok), checks };
+    ok: checks.length > 0 && checks.every(check => check.ok), checks };
 }
 
 async function verifyWebRun(directory, job) {

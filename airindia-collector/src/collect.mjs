@@ -6,12 +6,13 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { chromium, firefox } from 'playwright';
-import { parseSearchResponse, extractPageCards, matchFaresToCards } from './parse.mjs';
+import { extractCardsFromHtml, extractPageCards, selectMatchingResponse } from './parse.mjs';
 import { verifySearch } from './verify.mjs';
 import { chromeExecutable } from './browser-path.mjs';
+import { resolveEntryUrl } from './entry-url.mjs';
+export { resolveEntryUrl } from './entry-url.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const HOME = 'https://www.airindia.com/in/en/book/search-flights.html';
 const HANDOFF = '/in/en/refx-booking.html';
 const DENIAL = new Set(['CAPTCHA', 'ACCESS_DENIED', 'RATE_LIMITED', 'SESSION_EXPIRED']);
 const RETRYABLE = new Set(['TIMEOUT', 'SITE_NETWORK_FAILURE', 'FORM_UNCONFIRMED',
@@ -25,7 +26,7 @@ export function parseArgs(args) {
   const options = { searches: [], mode: 'headless', output: path.join(root, 'runs'),
     profile: null, proxy: null, proxyUser: null, proxyPassword: null,
     interactionDelayMs: 1800, minIntervalMs: 20000, retries: 1, externalChrome: false,
-    browser: 'chrome',
+    browser: 'chrome', entryUrl: undefined,
     simpleCaptcha: false, localCaptchaSolver: false, audioCaptchaSolver: false,
     deferVerification: false };
   for (let index = 0; index < args.length; index++) {
@@ -45,7 +46,8 @@ export function parseArgs(args) {
           new Date(`${match[3]}T00:00:00Z`).toISOString().slice(0, 10) !== match[3])
         throw new Error(`Invalid search ${value}; use DEL:BOM:YYYY-MM-DD`);
       options.searches.push({ origin: match[1], destination: match[2], travelDate: match[3] });
-    } else if (arg === '--output') options.output = path.resolve(value);
+    } else if (arg === '--entry-url') options.entryUrl = resolveEntryUrl(value);
+    else if (arg === '--output') options.output = path.resolve(value);
     else if (arg === '--browser') options.browser = value;
     else if (arg === '--profile') options.profile = path.resolve(value);
     else if (arg === '--proxy') options.proxy = value;
@@ -56,6 +58,7 @@ export function parseArgs(args) {
     else if (arg === '--retries') options.retries = Number(value);
     else throw new Error(`Unknown option ${arg}`);
   }
+  options.entryUrl = resolveEntryUrl(options.entryUrl);
   if (!options.searches.length || options.searches.length > 54)
     throw new Error('Provide 1–54 searches');
   if (!Number.isInteger(options.interactionDelayMs) || options.interactionDelayMs < 0 ||
@@ -83,6 +86,10 @@ export function parseArgs(args) {
   return options;
 }
 
+export async function navigateToEntry(page, options = {}) {
+  return page.goto(resolveEntryUrl(options.entryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 });
+}
+
 async function freeLoopbackPort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -105,7 +112,7 @@ async function launchBrowser(manifest, options) {
         ...(options.proxyUser ? { username: options.proxyUser } : {}),
         ...(options.proxyPassword ? { password: options.proxyPassword } : {}) } } : {})
     });
-    return { context, close: () => context.close() };
+    return { context, browserVersion: context.browser()?.version() || null, close: () => context.close() };
   }
   const port = await freeLoopbackPort();
   const chrome = spawn(executablePath, [
@@ -126,7 +133,7 @@ async function launchBrowser(manifest, options) {
     if (!browser) throw new Error('Chrome debugging endpoint did not become ready');
     const context = browser.contexts()[0];
     if (!context) throw new Error('Chrome did not provide a persistent browser context');
-    return { context, cdpUrl: `http://127.0.0.1:${port}`, close: async () => {
+    return { context, browserVersion: browser.version(), cdpUrl: `http://127.0.0.1:${port}`, close: async () => {
       await browser.close().catch(() => {});
       if (chrome.exitCode === null) chrome.kill('SIGTERM');
     } };
@@ -138,7 +145,7 @@ async function launchBrowser(manifest, options) {
 
 async function sourceFingerprint() {
   const files = ['src/collect.mjs', 'src/parse.mjs', 'src/verify.mjs', 'src/web-jobs.mjs',
-    'src/browser-path.mjs', 'src/local_recaptcha_solver.py',
+    'src/browser-path.mjs', 'src/entry-url.mjs', 'src/local_recaptcha_solver.py',
     'src/local_audio_solver.py', 'package-lock.json'];
   return hash(Buffer.concat(await Promise.all(files.map(file => fs.readFile(path.join(root, file))))));
 }
@@ -181,15 +188,21 @@ async function runLocalSolver(cdpUrl, directory, mode = 'image') {
   });
 }
 
-function classify(error, network, text = '') {
-  if (/verify you are human|please check the box below|captcha|security challenge/i.test(text))
-    return { code: 'CAPTCHA', detail: 'Air India displayed a human verification challenge' };
+function classify(error, network, text = '', { visibleChallenge = null, siteError = false } = {}) {
   if (/access denied|you don't have permission|request blocked/i.test(text))
     return { code: 'ACCESS_DENIED', detail: 'Air India displayed an access denial' };
-  const handoff = network.findLast(item => item.path === HANDOFF && item.method === 'POST');
-  if (handoff?.status === 403) return { code: 'ACCESS_DENIED', detail: 'Air India booking handoff returned HTTP 403' };
-  if (handoff?.status === 429) return { code: 'RATE_LIMITED', detail: 'Air India booking handoff returned HTTP 429' };
-  if (handoff?.status === 401) return { code: 'SESSION_EXPIRED', detail: 'Air India booking handoff returned HTTP 401' };
+  const denial = network.findLast(item => [401, 403, 429].includes(item.status) &&
+    ((item.path === HANDOFF && item.method === 'POST') ||
+      (item.navigationResponse === true && item.method === 'GET') ||
+      item.fareResponse === true));
+  if (denial) {
+    const code = { 401: 'SESSION_EXPIRED', 403: 'ACCESS_DENIED', 429: 'RATE_LIMITED' }[denial.status];
+    return { code, detail: `Air India search request returned HTTP ${denial.status}` };
+  }
+  if (visibleChallenge === true || (visibleChallenge === null &&
+      /verify you are human|please check the box below|captcha|security challenge/i.test(text)))
+    return { code: 'CAPTCHA', detail: 'Air India displayed a human verification challenge' };
+  if (siteError) return { code: 'SITE_ERROR', detail: 'Air India reported an unexpected issue processing the flight request' };
   if (error.code) return { code: error.code, detail: error.message };
   if (/ERR_CERT_|CERTIFICATE_VERIFY_FAILED/i.test(error.message))
     return { code: 'TLS_TRUST_FAILURE', detail: error.message };
@@ -204,7 +217,117 @@ export function classifyFailure(error, network, text = '') {
   return cause;
 }
 
-async function selectAirport(page, label, code, delayMs) {
+export async function readPageAccessState(page) {
+  return page.evaluate(() => {
+    const visible = node => {
+      if (!node || !node.getClientRects().length) return false;
+      for (let current = node; current; current = current.parentElement) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0) return false;
+      }
+      const rect = node.getBoundingClientRect();
+      const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
+      const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
+      const top = document.elementFromPoint(x, y);
+      return !!top && (node.contains(top) || top.contains(node));
+    };
+    const ready = visible(document.body);
+    const explicitText = /verify you are human|please check the box below|security challenge/i;
+    const challenge = ready && [...document.querySelectorAll('h1,h2,h3,p,label,iframe[title*="reCAPTCHA"],iframe[title*="challenge"]')]
+      .some(node => visible(node) && (node.tagName === 'IFRAME' || explicitText.test(node.innerText || '')));
+    const siteError = ready && [...document.querySelectorAll('.ai-pb-no-flights-title')]
+      .some(node => visible(node) && /^something went wrong$/i.test(node.innerText.trim()) &&
+        /system is facing an unexpected issue/i.test(node.parentElement.innerText));
+    return { ready, text: ready ? document.body.innerText : '', visibleChallenge: challenge, siteError };
+  }).catch(() => ({ ready: false, text: '', visibleChallenge: false }));
+}
+
+export async function classifyPageFailure(page, error, network) {
+  const state = await readPageAccessState(page);
+  return classify(error, network, state.text, state);
+}
+
+export async function prepareBookingInteraction(page, target) {
+  // Dismiss ordinary navigation without forcing clicks or changing overlays.
+  await page.keyboard.press('Escape');
+  const viewport = page.viewportSize();
+  await page.mouse.move(Math.max(1, (viewport?.width || 1440) - 10),
+    Math.max(1, (viewport?.height || 900) - 10));
+  await target.evaluate(node => node.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+}
+
+export async function selectOneWay(page, delayMs = 0) {
+  const selector = 'input[value="one-way"]';
+  const input = page.locator(selector).first();
+  await input.waitFor({ state: 'attached', timeout: 20000 });
+  await sleep(delayMs);
+  if (await input.isVisible()) {
+    await input.check();
+    if (!await input.isChecked()) throw codedError('FORM_UNCONFIRMED', 'One Way was not selected');
+    return;
+  }
+  const label = page.locator('label').filter({ has: page.locator(selector) })
+    .filter({ visible: true }).first();
+  await label.waitFor({ state: 'visible', timeout: 10000 });
+  await prepareBookingInteraction(page, label);
+  try { await label.click({ timeout: 3000 }); }
+  catch {
+    await prepareBookingInteraction(page, label);
+    await label.click({ timeout: 7000 });
+  }
+  if (!await label.locator(selector).isChecked())
+    throw codedError('FORM_UNCONFIRMED', 'One Way was not selected');
+}
+
+export async function confirmSelectedAirport(field, code, city,
+  { timeoutMs = 5000, pollingMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const input = field.locator('input[role="combobox"]');
+  let state;
+  do {
+    state = { code: (await input.inputValue()).trim(),
+      city: (await field.locator('.ai-origin-destination__bottom-label').innerText()).trim(),
+      expanded: await input.getAttribute('aria-expanded') };
+    if (state.code === code && state.city.toUpperCase() === city.toUpperCase() && state.expanded === 'false')
+      return { code, city: state.city };
+    await sleep(pollingMs);
+  } while (Date.now() < deadline);
+  throw codedError('FORM_UNCONFIRMED', `Airport ${code} did not finish selection: ${JSON.stringify(state)}`);
+}
+
+export async function selectAirport(page, label, code, delayMs = 0) {
+  const homepageField = page.locator(label === 'FROM'
+    ? '.ai-origin-destination__field-container[aria-label="Select origin airport"]'
+    : '.ai-origin-destination__field-container[aria-label="Select destination airport"]')
+    .filter({ visible: true }).first();
+  if (await homepageField.count()) {
+    const input = homepageField.locator('input[role="combobox"]');
+    await input.click({ timeout: 10000 });
+    await input.fill('');
+    await input.fill(code);
+    const option = page.getByRole('option').filter({
+      has: page.locator(`.ai-autocomplete-option__airport-code:text-is("${code}")`)
+    }).first();
+    await option.waitFor({ state: 'visible', timeout: 10000 });
+    const city = (await option.locator('.ai-autocomplete-option__city').innerText()).split(',')[0].trim();
+    if (!city) throw codedError('FORM_UNCONFIRMED', `Airport ${code} option has no city`);
+    await sleep(delayMs);
+    try { await option.click({ timeout: 5000 }); }
+    catch (error) {
+      // The widget can commit the origin and focus the destination while its
+      // original option is disappearing. Accept only the exact committed
+      // airport, never the typed code or another field's autocomplete.
+      try { return await confirmSelectedAirport(homepageField, code, city, { timeoutMs: 1000 }); }
+      catch { /* A missing commit requires a fresh selection below. */ }
+      await input.click({ timeout: 10000 });
+      await input.fill('');
+      await input.fill(code);
+      await option.waitFor({ state: 'visible', timeout: 10000 });
+      await option.click({ timeout: 5000 });
+    }
+    await option.waitFor({ state: 'hidden', timeout: 10000 });
+    return confirmSelectedAirport(homepageField, code, city);
+  }
   const open = page.getByRole('button', { name: label, exact: true }).first();
   await open.click({ timeout: 10000 });
   const input = page.getByPlaceholder('Search airport...');
@@ -245,11 +368,55 @@ async function selectAirport(page, label, code, delayMs) {
   if (!selected.includes(code)) throw codedError('FORM_UNCONFIRMED', `${label} did not confirm ${code}`);
 }
 
-async function selectDate(page, isoDate, delayMs) {
+export async function selectDate(page, isoDate, delayMs = 0) {
   const date = new Date(`${isoDate}T12:00:00Z`);
   const month = new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
   const option = `${date.getUTCFullYear()}-${date.getUTCMonth()}`;
   const day = String(date.getUTCDate());
+  const homepage = page.locator('.ai-booking-widget--desktop.ai-booking-widget--homepage')
+    .filter({ visible: true }).first();
+  if (await homepage.count()) {
+    // The same button also contains Add Return. Its center can open return
+    // selection; target the visible departure field itself.
+    await homepage.locator('button[aria-label="Open date picker"] .ai-booking-widget__date-field')
+      .first().click({ timeout: 10000 });
+    const calendar = page.locator('.ai-date-picker').filter({ visible: true }).first();
+    await calendar.waitFor({ state: 'visible', timeout: 10000 });
+    if (!await calendar.getByRole('heading', { name: 'Select Departure Date', exact: true }).isVisible())
+      throw codedError('FORM_UNCONFIRMED', 'The calendar did not open departure-date selection');
+    const oneWay = calendar.locator('input[name="isOneWay"]');
+    if (await oneWay.count() && !await oneWay.isChecked())
+      throw codedError('FORM_UNCONFIRMED', 'The departure calendar opened in return-trip mode');
+    const dateName = `${date.getUTCMonth() + 1}/${day}/${date.getUTCFullYear()}`;
+    const dateButton = calendar.getByRole('button', { name: dateName, exact: true });
+    for (let step = 0; step < 18 && !await dateButton.isVisible().catch(() => false); step++) {
+      const next = calendar.getByRole('button', { name: 'Next month', exact: true });
+      if (!await next.isEnabled().catch(() => false)) break;
+      await next.click({ timeout: 10000 });
+      await sleep(Math.max(delayMs, 250));
+    }
+    if (!await dateButton.isVisible().catch(() => false) || !await dateButton.isEnabled())
+      throw codedError('CALENDAR_NAVIGATION_FAILED', `The calendar did not offer ${isoDate}`);
+    await dateButton.click({ timeout: 10000 });
+    // The homepage one-way picker commits and closes on date selection. Other
+    // widget versions keep an explicit confirmation button. Support both, then
+    // verify the committed date and trip mode rather than trusting the click.
+    const confirm = calendar.getByRole('button', { name: 'Confirm', exact: true });
+    const commitDeadline = Date.now() + 10000;
+    while (await calendar.isVisible().catch(() => false)) {
+      if (await confirm.isVisible().catch(() => false) && await confirm.isEnabled()) {
+        await confirm.click({ timeout: 10000 });
+        break;
+      }
+      if (Date.now() >= commitDeadline)
+        throw codedError('FORM_UNCONFIRMED', 'The departure calendar did not commit the selected date');
+      await sleep(100);
+    }
+    await calendar.waitFor({ state: 'hidden', timeout: 10000 });
+    await sleep(delayMs);
+    await confirmBookingForm(page, { travelDate: isoDate }, { dateOnly: true });
+    return;
+  }
   await page.getByRole('button', { name: /Depart\s*Select Date/ }).first().click({ timeout: 10000 });
   const monthHeading = page.locator('h4').filter({ hasText: month }).filter({ visible: true });
   if (!await monthHeading.count()) {
@@ -268,45 +435,229 @@ async function selectDate(page, isoDate, delayMs) {
     `Departure date displayed ${actual.replace(/\s+/g, ' ')} instead of ${expected}`);
 }
 
+export async function confirmBookingForm(page, query, { dateOnly = false, airportSelections = {} } = {}) {
+  const date = new Date(`${query.travelDate}T12:00:00Z`);
+  const dateLabel = `${String(date.getUTCDate()).padStart(2, '0')} ${new Intl.DateTimeFormat('en-US',
+    { month: 'short', timeZone: 'UTC' }).format(date).toUpperCase()} ${date.getUTCFullYear()}`;
+  const normalized = text => text.replace(/,/g, '').replace(/\s+/g, ' ').trim().toUpperCase();
+  const homepage = page.locator('.ai-booking-widget--desktop.ai-booking-widget--homepage')
+    .filter({ visible: true }).first();
+  if (await homepage.count()) {
+    const dates = normalized(await homepage.locator('button[aria-label="Open date picker"]').innerText());
+    const oneWay = homepage.locator('input[value="one-way"]');
+    if (!dates.includes(dateLabel) || !/ADD RETURN/.test(dates) || !await oneWay.isChecked())
+      throw codedError('FORM_UNCONFIRMED', 'The homepage did not confirm the requested one-way departure date');
+    if (!dateOnly) {
+      for (const [field, expected] of [['origin', query.origin], ['destination', query.destination]]) {
+        const container = homepage.locator(`.ai-origin-destination__field-container[aria-label="Select ${field} airport"]`);
+        const input = container.locator('input[role="combobox"]');
+        const actual = await input.inputValue();
+        const city = (await container.locator('.ai-origin-destination__bottom-label').innerText()).trim();
+        if (actual.trim() !== expected || await input.getAttribute('aria-expanded') !== 'false' ||
+            !city || /^(Origin|Destination)$/i.test(city) ||
+            (airportSelections[field] && city.toUpperCase() !== airportSelections[field].city.toUpperCase()))
+          throw codedError('FORM_UNCONFIRMED', `The homepage ${field} changed after selection`);
+      }
+    }
+    return homepage;
+  }
+  const widget = page.locator('.ai-booking-widget').first();
+  const text = normalized(await widget.innerText());
+  if (!text.includes(dateLabel) || (!dateOnly && ![query.origin, query.destination].every(code =>
+      new RegExp(`\\b${code}\\b`).test(text))))
+    throw codedError('FORM_UNCONFIRMED', 'The booking form changed after the cookie dialog');
+  if (!await widget.locator('input[value="one-way"]').isChecked())
+    throw codedError('FORM_UNCONFIRMED', 'The booking form is no longer one way');
+  return widget;
+}
+
+export async function waitForMatchingResults(pageOrGet, responses, query, network,
+  { timeoutMs = 20000, pollingMs = 1000, onSiteError = null, onSiteRetry = null } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let previousMatch = null;
+  let previousPage = null;
+  let siteRetriedAt = null;
+  let lastSiteError = false;
+  while (Date.now() < deadline) {
+    const page = typeof pageOrGet === 'function' ? pageOrGet() : pageOrGet;
+    const state = await readPageAccessState(page);
+    const access = classify(new Error('Air India results check'), network, state.text,
+      state);
+    if (DENIAL.has(access.code)) throw codedError(access.code, access.detail);
+    lastSiteError = access.code === 'SITE_ERROR';
+    if (access.code === 'SITE_ERROR') {
+      const retry = page.locator('button#ai-pb-air-bound-retry-button');
+      if (siteRetriedAt === null) {
+        await onSiteError?.();
+        if (!await retry.isVisible().catch(() => false) || !await retry.isEnabled())
+          throw codedError('SITE_ERROR', access.detail);
+        siteRetriedAt = Date.now();
+        await retry.click({ timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+        await onSiteRetry?.();
+        previousMatch = null;
+      }
+      await page.waitForTimeout(pollingMs);
+      continue;
+    }
+    if (state.ready && responses.length && await page.locator('.ai-pb-flight-card-wrapper').count()) {
+      try {
+        const cards = await extractPageCards(page);
+        const offer = selectMatchingResponse(responses, cards, query);
+        const currentMatch = JSON.stringify([cards, offer.body]);
+        if (currentMatch === previousMatch && page === previousPage) return true;
+        previousMatch = currentMatch;
+        previousPage = page;
+      } catch { previousMatch = null; }
+    } else previousMatch = null;
+    try { await page.waitForTimeout(pollingMs); }
+    catch (error) {
+      if (typeof pageOrGet !== 'function' || pageOrGet() === page) throw error;
+    }
+  }
+  if (lastSiteError) throw codedError('SITE_ERROR',
+    'Air India still reported an unexpected issue after the single page Retry and bounded results wait');
+  return false;
+}
+
+// Deliberately omit credentials, ports, query strings, fragments, and payloads.
+export function airIndiaLocation(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) &&
+      (url.hostname === 'airindia.com' || url.hostname.endsWith('.airindia.com'))
+      ? { protocol: url.protocol, host: url.hostname, path: url.pathname } : null;
+  } catch { return null; }
+}
+
+export function isMainFrameNavigation(request, page) {
+  try { return request.isNavigationRequest() && request.frame() === page.mainFrame(); }
+  catch { return false; }
+}
+
+export function describeAirIndiaResponse(response, statuses = new WeakMap()) {
+  const target = airIndiaLocation(response.url());
+  if (!target) return null;
+  const request = response.request();
+  statuses.set(request, response.status());
+  const redirects = [];
+  for (let previous = request.redirectedFrom(); previous; previous = previous.redirectedFrom()) {
+    const location = airIndiaLocation(previous.url());
+    if (location) redirects.unshift({ ...location, status: statuses.get(previous) ?? null });
+  }
+  let redirectTo = null;
+  if (response.status() >= 300 && response.status() < 400) {
+    try {
+      const location = response.headers().location;
+      if (location) redirectTo = airIndiaLocation(new URL(location, response.url()).href);
+    }
+    catch { /* Missing or invalid Location must not interrupt evidence capture. */ }
+  }
+  return { ...target, method: request.method(), status: response.status(), redirects,
+    ...(redirectTo ? { redirectTo } : {}) };
+}
+
+// Context events include a popup's initial navigation response, which can arrive
+// before page-level listeners are installed. Scope them to this attempt's pages.
+export function observeSearchPages(context, initialPage, { onResponse, onRequestFailed, onPage = () => {} }) {
+  const pages = new Set([initialPage]);
+  const popupListeners = new Map();
+  const observe = candidate => {
+    if (pages.has(candidate)) return;
+    pages.add(candidate);
+    const popup = child => observe(child);
+    candidate.on('popup', popup);
+    popupListeners.set(candidate, popup);
+    onPage(candidate);
+  };
+  const initialPopup = candidate => observe(candidate);
+  initialPage.on('popup', initialPopup);
+  popupListeners.set(initialPage, initialPopup);
+  const belongs = async candidate => {
+    if (pages.has(candidate)) return true;
+    const lineage = [];
+    const visited = new Set();
+    let ancestor = candidate;
+    while (ancestor && !visited.has(ancestor) && lineage.length < 10) {
+      if (pages.has(ancestor)) {
+        for (const child of lineage.reverse()) observe(child);
+        return true;
+      }
+      visited.add(ancestor);
+      lineage.push(ancestor);
+      try { ancestor = await ancestor.opener(); } catch { return false; }
+    }
+    return false;
+  };
+  const response = async value => {
+    let source;
+    try { source = value.request().frame().page(); } catch { return; }
+    if (await belongs(source)) onResponse(value, source);
+  };
+  const failed = async value => {
+    let source;
+    try { source = value.frame().page(); } catch { return; }
+    if (await belongs(source)) onRequestFailed(value, source);
+  };
+  context.on('response', response);
+  context.on('requestfailed', failed);
+  return { pages, dispose: () => {
+    context.off('response', response);
+    context.off('requestfailed', failed);
+    for (const [candidate, listener] of popupListeners) candidate.off('popup', listener);
+  } };
+}
+
 async function collectAttempt(context, query, directory, options, log, attempt, cdpUrl) {
-  const page = await context.newPage();
+  let page = await context.newPage();
   await page.addLocatorHandler(page.locator('#onetrust-accept-btn-handler'), async accept => {
     await accept.click({ timeout: 5000 });
     await log('cookie_consent_dismissed', { query, attempt });
   });
   const network = [];
-  const candidateResponses = [];
+  const completedResponses = [];
+  let observedHandoff = null;
   let submitted = false;
   let stage = 'browser_ready';
   let evidence = {};
   const stageLog = async value => { stage = value; await log('stage', { query, attempt, stage: value }); };
-  const site = url => { try { const parsed = new URL(url); return parsed.hostname.endsWith('airindia.com') ?
-    { host: parsed.hostname, path: parsed.pathname } : null; } catch { return null; } };
-  page.on('response', response => {
-    const target = site(response.url());
+  const site = airIndiaLocation;
+  const responseStatuses = new WeakMap();
+  const observed = observeSearchPages(context, page, {
+    onPage: candidate => { if (submitted) page = candidate; },
+    onResponse: (response, responsePage) => {
+    const target = describeAirIndiaResponse(response, responseStatuses);
     if (!target) return;
-    const record = { at: stamp(), ...target, method: response.request().method(), status: response.status() };
-    if (record.status >= 400 || record.path === HANDOFF) network.push(record);
+    const record = { at: stamp(), ...target, navigationResponse: isMainFrameNavigation(response.request(), responsePage),
+      fareResponse: /json/i.test(response.headers()['content-type'] || '') &&
+        /availability|offer|flight|journey|shopping/i.test(target.path) && !target.path.startsWith('/nNnW/') };
+    if (record.status >= 400 || record.path === HANDOFF || record.navigationResponse) network.push(record);
+    if (submitted && record.path === HANDOFF && record.method === 'POST') observedHandoff = response;
     if (submitted && /json/.test(response.headers()['content-type'] || '') &&
         !record.path.startsWith('/nNnW/') && /api|availability|offer|flight|search|journey|shopping/i.test(record.path))
-      candidateResponses.push(response.text().then(body => ({ record, body })).catch(() => null));
-  });
-  page.on('requestfailed', request => {
+      void response.text().then(body => {
+        const candidate = { record, body };
+        completedResponses.push(candidate);
+        return candidate;
+      }).catch(() => null);
+    },
+    onRequestFailed: request => {
     const target = site(request.url());
     if (target) network.push({ at: stamp(), ...target, method: request.method(),
       failed: request.failure()?.errorText || 'unknown' });
+    }
   });
   try {
     await stageLog('browser_ready');
-    const home = await page.goto(HOME, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    const home = await navigateToEntry(page, options);
     await stageLog('homepage_loaded');
-    if (home?.status() === 403) throw codedError('ACCESS_DENIED', 'Air India booking page returned HTTP 403');
-    await page.locator('input[value="one-way"]').waitFor({ state: 'visible', timeout: 20000 });
-    await sleep(options.interactionDelayMs);
-    await page.locator('input[value="one-way"]').check();
+    if ([401, 403, 429].includes(home?.status())) {
+      const code = { 401: 'SESSION_EXPIRED', 403: 'ACCESS_DENIED', 429: 'RATE_LIMITED' }[home.status()];
+      throw codedError(code, `Air India booking page returned HTTP ${home.status()}`);
+    }
+    await selectOneWay(page, options.interactionDelayMs);
     await stageLog('airports_ready');
-    await selectAirport(page, 'FROM', query.origin, options.interactionDelayMs);
-    await selectAirport(page, 'TO', query.destination, options.interactionDelayMs);
+    const originSelection = await selectAirport(page, 'FROM', query.origin, options.interactionDelayMs);
+    const destinationSelection = await selectAirport(page, 'TO', query.destination, options.interactionDelayMs);
     await selectDate(page, query.travelDate, options.interactionDelayMs);
     await stageLog('form_confirmed');
     const form = await savePage(page, directory, `form-attempt-${attempt}`);
@@ -314,45 +665,42 @@ async function collectAttempt(context, query, directory, options, log, attempt, 
     evidence.formPageSha256 = form.htmlSha256;
     evidence.formScreenshot = form.screenshot;
     evidence.formScreenshotSha256 = form.screenshotSha256;
-    const search = page.getByRole('button', { name: 'Search', exact: true }).first();
-    const widgetText = await page.locator('.ai-booking-widget').first().innerText();
-    const expectedDate = new Date(`${query.travelDate}T12:00:00Z`);
-    const dateLabel = `${String(expectedDate.getUTCDate()).padStart(2, '0')} ${new Intl.DateTimeFormat('en-US',
-      { month: 'short', timeZone: 'UTC' }).format(expectedDate).toUpperCase()} ${expectedDate.getUTCFullYear()}`;
-    if (![query.origin, query.destination, dateLabel].every(value => widgetText.includes(value)))
-      throw codedError('FORM_UNCONFIRMED', 'The booking form changed after the cookie dialog');
+    const widget = await confirmBookingForm(page, query, {
+      airportSelections: { origin: originSelection, destination: destinationSelection } });
+    const search = widget.getByRole('button', { name: 'Search', exact: true }).first();
     if (!await search.isEnabled()) throw codedError('FORM_UNCONFIRMED', 'Air India search remained disabled');
-    const handoffWait = page.waitForResponse(response => {
+    const homepageWidget = await page.locator('.ai-booking-widget--desktop.ai-booking-widget--homepage')
+      .filter({ visible: true }).count() > 0;
+    const handoffWait = homepageWidget ? null : page.waitForResponse(response => {
       const target = site(response.url());
       return target?.path === HANDOFF && response.request().method() === 'POST';
     }, { timeout: 50000 }).catch(() => null);
     submitted = true;
     await search.click({ timeout: 12000 });
     await stageLog('search_submitted');
-    const handoff = await handoffWait;
-    if (!handoff) throw codedError('SITE_NETWORK_FAILURE', 'No Air India booking handoff response arrived');
-    const handoffBody = await handoff.text().catch(() => null);
+    if (homepageWidget) await sleep(2500);
+    const handoff = homepageWidget ? observedHandoff : await handoffWait;
+    if (!homepageWidget && !handoff) throw codedError('SITE_NETWORK_FAILURE', 'No Air India booking handoff response arrived');
+    const handoffBody = handoff ? await handoff.text().catch(() => null) : null;
     if (handoffBody) {
       const filename = `booking-response-attempt-${attempt}.html`;
       await fs.writeFile(path.join(directory, filename), handoffBody, { mode: 0o600 });
       evidence.bookingResponse = filename;
       evidence.bookingResponseSha256 = hash(handoffBody);
     }
-    await page.waitForTimeout(2500);
-    let text = await page.locator('body').innerText().catch(() => '');
+    if (!homepageWidget) await page.waitForTimeout(2500);
     let captchaPuzzleRequired = false;
     let solverOutcome = null;
     if ((options.localCaptchaSolver || options.audioCaptchaSolver) &&
-        classify(new Error('Air India access check'), network, text).code === 'CAPTCHA') {
+        (await classifyPageFailure(page, new Error('Air India access check'), network)).code === 'CAPTCHA') {
       const solverMode = options.audioCaptchaSolver ? 'audio' : 'image';
       await stageLog(`${solverMode}_captcha_solver`);
       const outcome = await runLocalSolver(cdpUrl, directory, solverMode);
       solverOutcome = outcome;
       await log(`${solverMode}_captcha_solver_result`, { query, attempt, ...outcome });
       if (outcome.status === 'challenge_submitted') await page.waitForTimeout(10000);
-      text = await page.locator('body').innerText().catch(() => '');
     }
-    if (options.simpleCaptcha && classify(new Error('Air India access check'), network, text).code === 'CAPTCHA') {
+    if (options.simpleCaptcha && (await classifyPageFailure(page, new Error('Air India access check'), network)).code === 'CAPTCHA') {
       await stageLog('simple_captcha');
       await log('captcha_checkbox_attempt', { query, attempt });
       try {
@@ -370,9 +718,8 @@ async function collectAttempt(context, query, directory, options, log, attempt, 
       } catch (captchaError) {
         await log('captcha_checkbox_failed', { query, attempt, detail: captchaError.message.slice(0, 300) });
       }
-      text = await page.locator('body').innerText().catch(() => '');
     }
-    const access = classify(new Error('Air India access check'), network, text);
+    const access = await classifyPageFailure(page, new Error('Air India access check'), network);
     if (captchaPuzzleRequired && access.code === 'CAPTCHA')
       access.detail = 'Google reCAPTCHA opened an image-selection puzzle after the checkbox';
     if (solverOutcome?.status === 'rate_limited' && access.code === 'CAPTCHA')
@@ -380,57 +727,47 @@ async function collectAttempt(context, query, directory, options, log, attempt, 
     if (solverOutcome && solverOutcome.status !== 'challenge_submitted' && access.code === 'CAPTCHA')
       access.detail = `Access check remained open after local helper: ${solverOutcome.status}${solverOutcome.detail ? ` (${solverOutcome.detail})` : ''}`;
     if (DENIAL.has(access.code)) throw codedError(access.code, access.detail);
-    if (handoff.status() !== 200) throw codedError('SITE_NETWORK_FAILURE',
+    if (handoff && handoff.status() !== 200) throw codedError('SITE_NETWORK_FAILURE',
       `Air India booking handoff returned HTTP ${handoff.status()}`);
-    const resultsDeadline = Date.now() + 20000;
-    while (Date.now() < resultsDeadline) {
-      if (candidateResponses.length && await page.locator('.ai-pb-flight-card-wrapper').count()) break;
-      await page.waitForTimeout(1000);
-      text = await page.locator('body').innerText().catch(() => '');
-      const lateAccess = classify(new Error('Air India results check'), network, text);
-      if (DENIAL.has(lateAccess.code)) throw codedError(lateAccess.code, lateAccess.detail);
-    }
+    const resultsStable = await waitForMatchingResults(() => page, completedResponses, query, network,
+      { onSiteError: () => log('site_error_detected', { query, attempt, stage }),
+        onSiteRetry: () => log('site_retry', { query, attempt, stage, count: 1, limit: 'per-collector-attempt' }) });
     const resultPage = await savePage(page, directory, `results-attempt-${attempt}`);
     evidence.resultPage = resultPage.html;
     evidence.resultPageSha256 = resultPage.htmlSha256;
     evidence.resultScreenshot = resultPage.screenshot;
     evidence.resultScreenshotSha256 = resultPage.screenshotSha256;
-    if (!await page.locator('.ai-pb-flight-card-wrapper').count())
-      throw codedError('RESULTS_NOT_RENDERED',
-        'Air India returned the booking shell but displayed no flight cards within 20 seconds');
-    await stageLog('results_rendered');
-    const responses = (await Promise.all(candidateResponses)).filter(Boolean);
-    if (!responses.length) throw codedError('FARE_RESPONSE_UNVERIFIED',
-      'No matching Air India flight-response JSON was observed after submission');
-    let offer;
+    // Preserve completed candidate evidence even if the rendered markup has
+    // changed. Pending bodies never extend the bounded results wait.
+    const responses = [...completedResponses];
     for (const [index, response] of responses.entries()) {
       const filename = `candidate-response-attempt-${attempt}-${index + 1}.json`;
       await fs.writeFile(path.join(directory, filename), response.body, { mode: 0o600 });
       evidence[`candidateResponse${index + 1}`] = filename;
       evidence[`candidateResponse${index + 1}Sha256`] = hash(response.body);
     }
-    for (const [index, response] of responses.entries()) {
-      const fares = parseSearchResponse(response.body, query);
-      if (fares !== null) { offer = { ...response, fares, index }; break; }
-    }
-    if (!offer) throw codedError('FARE_RESPONSE_UNVERIFIED',
-      'No Air India flight-offer response was observed after submission');
+    if (!await page.locator('.ai-pb-flight-card-wrapper').count())
+      throw codedError('RESULTS_NOT_RENDERED',
+        'Air India returned the booking shell but displayed no flight cards within 20 seconds');
+    await stageLog('results_rendered');
+    if (!responses.length) throw codedError('FARE_RESPONSE_UNVERIFIED',
+      'No matching Air India flight-response JSON was observed after submission');
+    const cards = extractCardsFromHtml(await fs.readFile(path.join(directory, resultPage.html), 'utf8'));
+    const offer = selectMatchingResponse(responses, cards, query);
+    if (!resultsStable) throw codedError('RESULTS_UNVERIFIED',
+      'Air India page and fare response did not stabilize within 20 seconds');
     await stageLog('airline_response_verified');
     const fares = offer.fares;
-    if (!fares.length) throw codedError('EMPTY_RESULTS', 'No exact-route Air India flight offers in the response');
-    const cards = await extractPageCards(page);
-    matchFaresToCards(fares, cards, query);
     evidence.airlineResponse = evidence[`candidateResponse${offer.index + 1}`];
     evidence.airlineResponseSha256 = hash(offer.body);
     await stageLog('fare_verified');
     await log('fare_verified', { query, attempt, exactAirportFlightCount: fares.length,
       renderedFlightCount: cards.length, lowestDisplayedFare: Math.min(...fares.map(fare => fare.price.displayedTotal)) });
-    return { status: 'ok', stage, query, collectedAt: stamp(), fares,
+    return { status: 'ok', fareEvidenceVersion: 2, stage, query, collectedAt: stamp(), fares,
       expectedJourneys: fares.length, coverage: { captured: fares.length, expectedJourneys: fares.length },
       network, evidence, attempt };
   } catch (error) {
-    const text = await page.locator('body').innerText().catch(() => '');
-    const cause = classifyFailure(error, network, text);
+    const cause = await classifyPageFailure(page, error, network);
     const failure = await savePage(page, directory, `failure-attempt-${attempt}`);
     evidence.failurePage = failure.html;
     evidence.failurePageSha256 = failure.htmlSha256;
@@ -439,14 +776,19 @@ async function collectAttempt(context, query, directory, options, log, attempt, 
     await log('failure', { query, attempt, stage, cause, network });
     return { status: DENIAL.has(cause.code) ? 'blocked' : 'failed', stage, cause, query,
       collectedAt: stamp(), fares: [], network, evidence, attempt };
-  } finally { await page.close().catch(() => {}); }
+  } finally {
+    observed.dispose();
+    await Promise.allSettled([...observed.pages].map(candidate => candidate.close()));
+  }
 }
 
 export async function collect(options) {
+  if (!Array.isArray(options.searches) || !options.searches.length || options.searches.length > 54)
+    throw new Error('Provide 1–54 searches');
   const id = `${stamp().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}`;
   const runDir = path.join(options.output, id);
   await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
-  const manifest = { id, startedAt: stamp(), finishedAt: null, source: HOME,
+  const manifest = { id, startedAt: stamp(), finishedAt: null, source: resolveEntryUrl(options.entryUrl),
     sourceFingerprint: await sourceFingerprint(), browserMode: options.mode,
     profile: options.profile || path.join(root, '.session',
       options.browser === 'chrome' ? options.mode : `firefox-${options.mode}`),
@@ -468,6 +810,10 @@ export async function collect(options) {
   let browserSession;
   try {
     browserSession = await launchBrowser(manifest, options);
+    manifest.browserVersion = browserSession.browserVersion;
+    await writeJson(path.join(runDir, 'manifest.json'), manifest);
+    await log('browser_launched', { browserVersion: manifest.browserVersion,
+      browserTransport: manifest.browserTransport });
   } catch (error) {
     const code = 'BROWSER_START_FAILED';
     await log('browser_failure', { cause: { code, detail: error.message } });
@@ -533,8 +879,7 @@ export async function collect(options) {
   } finally {
     await browserSession.close().catch(() => {});
   }
-  // The independent verifier starts a fresh Chrome. Close the collection
-  // browser first so a crowded machine does not crash its evidence tab.
+  // Close collection before independently verifying the saved evidence.
   for (const [index, query] of options.searches.entries()) {
     const directory = path.join(runDir, `${String(index + 1).padStart(2, '0')}-` +
       `${query.origin}-${query.destination}-${query.travelDate}`);

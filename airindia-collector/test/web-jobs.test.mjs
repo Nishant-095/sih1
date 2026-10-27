@@ -297,3 +297,82 @@ test('single-search retry keeps the original future travel date', async () => {
     await manager.cancel(second.id);
   } finally { await manager.close(); await fs.rm(root, { recursive: true, force: true }); }
 });
+
+test('dashboard workers inherit the validated entry URL captured when a run starts', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'airindia-dashboard-entry-'));
+  const previous = process.env.AIRINDIA_ENTRY_URL;
+  const campaign = 'https://www.airindia.com/?ai_pc=MYFLIGHTAIR';
+  let started, child;
+  process.env.AIRINDIA_ENTRY_URL = campaign;
+  const manager = new JobManager({ root, packageRoot: root, minLaunchGapMs: 1000,
+    spawnWorker: (_command, args) => {
+      started = args;
+      child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+      child.kill = () => child.emit('close', null, 'SIGTERM'); return child;
+    } });
+  try {
+    const run = await manager.create({ routes: ['DEL-BOM'], offsets: [5], browserMode: 'headless' });
+    while (!started) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(run.entryUrl, campaign);
+    assert.equal(started[started.indexOf('--entry-url') + 1], campaign);
+    const saved = JSON.parse(await fs.readFile(path.join(root, run.id, 'jobs.json'), 'utf8'));
+    assert.equal(saved.entryUrl, campaign);
+    await manager.cancel(run.id);
+  } finally {
+    await manager.close(); await fs.rm(root, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.AIRINDIA_ENTRY_URL;
+    else process.env.AIRINDIA_ENTRY_URL = previous;
+  }
+});
+
+test('an invalid shared entry URL is rejected before any dashboard worker starts', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'airindia-invalid-entry-'));
+  const previous = process.env.AIRINDIA_ENTRY_URL;
+  let launches = 0;
+  process.env.AIRINDIA_ENTRY_URL = 'https://elsewhere.example/';
+  const manager = new JobManager({ root, packageRoot: root,
+    spawnWorker: () => { launches++; throw new Error('worker must not launch'); } });
+  try {
+    await assert.rejects(manager.create({ routes: ['DEL-BOM'], offsets: [5] }), /AIRINDIA_ENTRY_URL/);
+    assert.equal(launches, 0);
+    assert.equal((await fs.readdir(root)).length, 0);
+  } finally {
+    await manager.close(); await fs.rm(root, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.AIRINDIA_ENTRY_URL;
+    else process.env.AIRINDIA_ENTRY_URL = previous;
+  }
+});
+
+test('dashboard retries preserve the saved run entry URL after the environment changes', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'airindia-retry-entry-'));
+  const sourceId = 'saved-entry-failure';
+  const travelDate = istDate(5);
+  const originalEntry = 'https://www.airindia.com/?ai_pc=MYFLIGHTAIR';
+  const previous = process.env.AIRINDIA_ENTRY_URL;
+  let started, child;
+  process.env.AIRINDIA_ENTRY_URL = 'https://www.airindia.com/';
+  const manager = new JobManager({ root, packageRoot: root, minLaunchGapMs: 1000,
+    spawnWorker: (_command, args) => {
+      started = args;
+      child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+      child.kill = () => child.emit('close', null, 'SIGTERM'); return child;
+    } });
+  try {
+    await fs.mkdir(path.join(root, sourceId));
+    await fs.writeFile(path.join(root, sourceId, 'jobs.json'), JSON.stringify({
+      id: sourceId, status: 'partial', stopReason: null, browserMode: 'headless',
+      entryUrl: originalEntry,
+      tasks: [{ id: '001', origin: 'DEL', destination: 'BOM', travelDate,
+        offset: 5, status: 'failed', cause: { code: 'SITE_NETWORK_FAILURE' },
+        events: [], fares: [] }] }));
+    const retry = await manager.retry(sourceId, '001');
+    while (!started) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(retry.entryUrl, originalEntry);
+    assert.equal(started[started.indexOf('--entry-url') + 1], originalEntry);
+    await manager.cancel(retry.id);
+  } finally {
+    await manager.close(); await fs.rm(root, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.AIRINDIA_ENTRY_URL;
+    else process.env.AIRINDIA_ENTRY_URL = previous;
+  }
+});

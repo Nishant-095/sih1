@@ -121,6 +121,19 @@ node src/verify.mjs web-runs/RUN_ID
 
 ## Using the desk
 
+The generic entry is `https://www.airindia.com/`. To use the exact entry verified
+on 26 October, start the dashboard with this explicit campaign setting:
+
+```bash
+AIRINDIA_ENTRY_URL='https://www.airindia.com/?ai_pc=MYFLIGHTAIR' npm run web
+```
+
+The CLI reads the same setting; `--entry-url` overrides it for one invocation.
+Dashboard jobs save their entry URL and retain it when retried. The campaign
+setting is explicit because its effect on available fares has not been isolated.
+The successful observed transport is visible Chrome through external Chrome/CDP;
+the CLI example below selects it, and the dashboard uses it for Visible Chrome.
+
 1. Enter one route per line, such as `DEL-BOM`, or use the route shortcuts. The city-pair shortcuts are research presets; the collector still checks the selected airline’s exact airport availability.
 2. Select one or more of the six offered future travel dates and choose visible or headless Chrome. Visible Chrome uses the dedicated persistent profile and is the tested mode.
 3. Start the run. Each route/date has its own progress bar, stage log, status, and saved evidence. The desk supports up to 54 searches per batch, spaces starts by at least 20 seconds, and stops queued requests after access denial.
@@ -132,6 +145,7 @@ For a direct command on Ubuntu:
 ```bash
 npm run collect -- \
   --search "DEL:BOM:$(date -d '+5 days' +%F)" \
+  --entry-url 'https://www.airindia.com/?ai_pc=MYFLIGHTAIR' \
   --headed --external-chrome --retries 0
 ```
 

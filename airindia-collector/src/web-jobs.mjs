@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { tryBrowserLease } from './browser-admission.mjs';
 import { verifySearch } from './verify.mjs';
+import { resolveEntryUrl } from './entry-url.mjs';
 
 export const STAGES = Object.freeze([
   'browser_ready', 'homepage_loaded', 'airports_ready', 'form_confirmed',
@@ -104,6 +105,7 @@ export class JobManager extends EventEmitter {
       requestedConcurrency: job.requestedConcurrency,
       resourceNote: job.resourceNote,
       browserMode: job.browserMode,
+      entryUrl: job.entryUrl,
       audioCaptchaSolver: Boolean(job.audioCaptchaSolver),
       tasks: job.tasks.map(publicTask) };
   }
@@ -134,6 +136,7 @@ export class JobManager extends EventEmitter {
       concurrency: plan.concurrency, requestedConcurrency: plan.requestedConcurrency || plan.concurrency,
       resourceNote: plan.resourceNote || null,
       browserMode: plan.browserMode, audioCaptchaSolver: Boolean(plan.audioCaptchaSolver),
+      entryUrl: resolveEntryUrl(plan.entryUrl),
       audioSolverPython: plan.audioSolverPython, retryOf,
       writeChain: Promise.resolve(),
       tasks: plan.tasks.map((task, index) => ({ ...task, id: String(index + 1).padStart(3, '0'),
@@ -157,6 +160,8 @@ export class JobManager extends EventEmitter {
   }
 
   async admitPlan(plan) {
+    try { plan = { ...plan, entryUrl: resolveEntryUrl(plan.entryUrl) }; }
+    catch (error) { throw inputError(error.message); }
     let audioSolverPython;
     if (plan.audioCaptchaSolver) {
       if (process.env.AIRINDIA_PROXY_SERVER)
@@ -185,6 +190,7 @@ export class JobManager extends EventEmitter {
     const route = { origin: task.origin, destination: task.destination };
     return this.createPlan(await this.admitPlan({ routes: [route], offsets: [task.offset], concurrency: 1,
       browserMode: source.browserMode || 'headed',
+      entryUrl: source.entryUrl,
       audioCaptchaSolver: Boolean(source.audioCaptchaSolver),
       tasks: [{ ...route, offset: task.offset, travelDate: task.travelDate }] }),
     { runId, taskId });
@@ -208,6 +214,7 @@ export class JobManager extends EventEmitter {
     const offsets = [...new Set(tasks.map(task => task.offset))].sort((a, b) => a - b);
     return this.createPlan(await this.admitPlan({ routes, offsets,
       browserMode: source.browserMode || 'headed', concurrency: Math.min(MAX_WORKERS, source.concurrency || 1, tasks.length),
+      entryUrl: source.entryUrl,
       audioCaptchaSolver: Boolean(source.audioCaptchaSolver),
       tasks: tasks.map(task => ({ origin: task.origin, destination: task.destination,
         travelDate: task.travelDate, offset: task.offset })) }),
@@ -326,6 +333,7 @@ export class JobManager extends EventEmitter {
       path.join(this.packageRoot, '.session', 'web-agents', profileMode, `agent-${worker}`);
     const args = [path.join(this.packageRoot, 'src', 'collect.mjs'),
       '--search', `${task.origin}:${task.destination}:${task.travelDate}`,
+      '--entry-url', job.entryUrl,
       '--output', output, '--profile', profile, '--interaction-delay-ms', '1800',
       '--min-interval-ms', '20000', '--retries', '1',
       '--defer-verification',
